@@ -1,0 +1,152 @@
+# .github/workflows/pr-impact-analysis.yml
+name: PR Impact Analysis
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  analyze-impact:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/impact')
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Get PR details
+      id: pr
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: pr } = await github.rest.pulls.get({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: context.issue.number,
+          });
+          return pr;
+    
+    - name: Get changed files
+      id: changed-files
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: files } = await github.rest.pulls.listFiles({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: context.issue.number,
+          });
+          return files;
+    
+    - name: Analyze code changes
+      id: analyze
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const files = ${{ steps.changed-files.outputs.result }};
+          
+          let analysis = {
+            totalFiles: files.length,
+            linesAdded: 0,
+            linesDeleted: 0,
+            fileTypes: {},
+            criticalFiles: [],
+            riskLevel: 'LOW'
+          };
+          
+          // Critical file patterns
+          const criticalPatterns = [
+            /package\.json$/,
+            /requirements\.txt$/,
+            /Dockerfile$/,
+            /\.env/,
+            /config/,
+            /migration/,
+            /database/,
+            /security/,
+            /auth/
+          ];
+          
+          files.forEach(file => {
+            analysis.linesAdded += file.additions;
+            analysis.linesDeleted += file.deletions;
+            
+            // Get file extension
+            const ext = file.filename.split('.').pop() || 'unknown';
+            analysis.fileTypes[ext] = (analysis.fileTypes[ext] || 0) + 1;
+            
+            // Check for critical files
+            if (criticalPatterns.some(pattern => pattern.test(file.filename))) {
+              analysis.criticalFiles.push(file.filename);
+            }
+          });
+          
+          // Determine risk level
+          const totalChanges = analysis.linesAdded + analysis.linesDeleted;
+          if (totalChanges > 500 || analysis.criticalFiles.length > 0) {
+            analysis.riskLevel = 'HIGH';
+          } else if (totalChanges > 100 || analysis.totalFiles > 10) {
+            analysis.riskLevel = 'MEDIUM';
+          }
+          
+          return analysis;
+    
+    - name: Post impact analysis comment
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const analysis = ${{ steps.analyze.outputs.result }};
+          
+          const riskEmoji = {
+            'LOW': '🟢',
+            'MEDIUM': '🟡', 
+            'HIGH': '🔴'
+          };
+          
+          const fileTypesList = Object.entries(analysis.fileTypes)
+            .map(([type, count]) => `- **${type}**: ${count} file(s)`)
+            .join('\n');
+          
+          const criticalFilesList = analysis.criticalFiles.length > 0 
+            ? `\n### ⚠️ Critical Files Modified:\n${analysis.criticalFiles.map(f => `- \`${f}\``).join('\n')}`
+            : '';
+          
+          const comment = `## ${riskEmoji[analysis.riskLevel]} PR Impact Analysis
+          
+          ### 📊 Change Summary
+          - **Files Changed**: ${analysis.totalFiles}
+          - **Lines Added**: +${analysis.linesAdded}
+          - **Lines Deleted**: -${analysis.linesDeleted}
+          - **Risk Level**: ${analysis.riskLevel}
+          
+          ### 📁 File Types
+          ${fileTypesList}
+          ${criticalFilesList}
+          
+          ### 🔍 Impact Assessment
+          ${analysis.riskLevel === 'HIGH' ? '**High Impact**: This PR contains significant changes or modifies critical files. Extra review recommended.' : 
+            analysis.riskLevel === 'MEDIUM' ? '**Medium Impact**: This PR contains moderate changes. Normal review process should be sufficient.' :
+            '**Low Impact**: This PR contains minimal changes with low risk.'}
+          
+          ### 📋 Recommended Actions
+          ${analysis.riskLevel === 'HIGH' ? '- [ ] Request senior developer review\n- [ ] Run full test suite\n- [ ] Consider staging deployment\n- [ ] Update documentation if needed' :
+            analysis.riskLevel === 'MEDIUM' ? '- [ ] Run relevant test suite\n- [ ] Check for breaking changes\n- [ ] Verify functionality' :
+            '- [ ] Basic functionality check\n- [ ] Code style review'}
+          
+          ---
+          *Analysis triggered by comment. Use \`/impact\` to re-run.*`;
+          
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body: comment
+          });
